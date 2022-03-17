@@ -1,0 +1,189 @@
+% Coherence model Global and Local Language with testcases
+% 2022.01 TSM
+%
+% instructions: 
+%   1) modify the last source line to select a system scenario
+%      e.g. include G8 to create LTS for global protocol G8, 
+%           or L8a||L8p||L8q  to create LTS for projected local protocol 
+%   2) create lts by running 'make lts'   (or manually: mcrl22lps g.mcrl2|lps2lts >g.lts)
+%
+% Model checking:
+%   - coherence test: run 'make test' to test all global protocols in turn
+%   - bisimulation tests: run 'sh bisim-test.sh' to test G8 and G9 against their local protocol counterparts
+
+sort RoleName = struct a|b|p|q|r; 
+sort Value = struct zero|one|two|three|four;
+
+act  send,enqueue,syncCoherence,send',
+     receive,dequeue,updateProp,setLast, receive' : RoleName # RoleName # Value;
+     lastRole : RoleName;  
+     lastEq : Bool;
+     lock,lock',unlock,unlock':RoleName # RoleName;     
+
+proc
+
+% Participants in our protocol have a process attribute 'prop' that is updated upon a receive
+
+  Role'(N:RoleName,prop:Value) = 
+     sum from:RoleName, v:Value . ((N != from) -> updateProp(from,N,v).Role'(N,v));
+
+
+% Channels are implementation of asynchronous communication, maximum queue size 5 is arbitrary
+
+  Channel'(from,to:RoleName,data:List(Value),size:Int) =
+     sum v:Value . ((size < 5) -> enqueue(from,to,v).Channel'(from,to,data <| v,succ(size)) ) +
+     (size > 0)                -> dequeue(from,to,head(data)).Channel'(from,to,tail(data), pred(size) );
+
+
+% Coherence' is a process that maintains the global coherence property 'last'
+% In addition it acts as a probe, to report coherence status information (via actions):
+%   lastRole(role)  : name of role that receives a new value for its prop
+%   lastEq(boolean) : true if the data values of roles coh1 and coh2 are equal (after the receive action)
+% Note that Coherence' is synchronized upon both send and receive. Further actions are blocked until report actions 
+% are done. This behavior ensures that the next transition after lastRole is always a lastEq action 
+
+  Coherence'(coh1,coh2:RoleName,coh1val,coh2val:Value,last:RoleName) =
+
+     % case 1: coh1 role receives a new value
+     sum from,to:RoleName,v:Value . 
+     (to == coh1) -> (setLast(from,to,v).   
+               lastRole(to).lastEq(v==coh2val).     
+               Coherence'(coh1,coh2,v,coh2val,to) ) +
+
+     % case 2: coh2 role receives a new value
+     sum from,to:RoleName,v:Value . 
+     (to == coh2) -> (setLast(from,to,v).
+               lastRole(to).lastEq(v==coh1val).
+               Coherence'(coh1,coh2,coh1val,v,to) ) +
+
+     % case 3: some other role receives a new value
+     sum from,to:RoleName,v:Value . 
+     ((to != coh1) && (to != coh2)) -> (setLast(from,to,v).
+               lastRole(to).lastEq(coh1val==coh2val).
+               Coherence'(coh1,coh2,coh1val,coh2val,to) ) +
+
+     % case send: just process and ignore
+     sum from,to:RoleName,v:Value . (syncCoherence(from,to,v).
+               Coherence'(coh1,coh2,coh1val,coh2val,last) ) ;
+
+
+% Data transfer 'Cpq' is a basic construct of our global language:  Cpq --send--> Fpq --receive--> 1
+% mcrl2 operators (sequential,option,parallel,recursion) are used to implement compositional constructs
+% Our local language uses 'send' and 'receive' as its basic constructs. Tau is supported natively by mcrl2.
+    
+  C(from:RoleName,to:RoleName,v:Value) = send(from,to,v).receive(from,to,v); 
+
+
+% Extension: We can add a Lock/Unlock operation to the language so that critical protocol
+% sections can be protected against loss of coherence.  We add a mutex to each property/role. 
+
+  LockManager(id:RoleName, locked:Bool, holder:RoleName) =
+     sum requester:RoleName . ( (locked && (requester==holder)) -> unlock(requester,id).  
+               LockManager(id,false,requester)) +
+     sum requester:RoleName . ( (!locked) -> lock(requester,id).  
+               LockManager(id,true,requester)) ;
+
+
+% ---------- a testset of concrete instances of coherence model protocol, feel free to add
+  
+% test of basic transitions as shown in figure Kripke structure  (excluding mirrorred cases)
+% s0..s6 refer to states in figure Thesis report
+
+  G0 = C(a,p,one).C(a,q,one);                         % coh(p,q) = true   (s0,s1,s3)
+  G1 = C(a,p,one).C(a,q,two);                         % coh(p,q) = false  (s0,s1,s4)
+  G2 = C(a,p,one).C(a,p,two);                         % coh(p,q) = false  (s0,s1,s6) 
+
+
+% tests of iRODS use case p = data object, q = replica
+
+  G3 = C(a,p,one).C(a,q,one)||C(b,p,two).C(b,q,two);  % coh(p,q) = false  (race condition)
+  G4 = C(a,p,one).C(a,q,one).C(b,p,two).C(b,q,two)+
+       C(b,p,two).C(b,q,two).C(a,p,one).C(a,q,one);   % coh(p,q) = true   (race solved using a different protocol)
+  G5 = lock(a,p).C(a,p,one).C(a,q,one).unlock(a,p) ||
+       lock(b,p).C(b,p,two).C(b,q,two).unlock(b,p);   % coh(p,q) = true   (race solved using mutex) 
+
+
+% test of chained coherence locking strategy coh(p,q) + coh(q,r)
+%  part 1: check coh(p,q)
+
+  G6 = lock(a,p).C(a,p,one).lock(a,q).C(a,q,one).
+       lock(a,r).unlock(a,p).C(a,r,one).
+       unlock(a,q).unlock(a,r) ||
+       lock(b,p).C(b,p,two).lock(b,q).C(b,q,two).
+       lock(b,r).unlock(b,p).C(b,r,two).
+       unlock(b,q).unlock(b,r);                       % coh(p,q) = true
+
+%  part 2: our mcf formula checks coh(p,q)
+%          hence to check coh(q,r) we reuse protocol G6
+%          and shuffle attribute names: p:=r, q:=p, r:=q
+  G7 = lock(a,r).C(a,r,one).lock(a,p).C(a,p,one).
+       lock(a,q).unlock(a,r).C(a,q,one).
+       unlock(a,p).unlock(a,q) ||
+       lock(b,r).C(b,r,two).lock(b,p).C(b,p,two).
+       lock(b,q).unlock(b,r).C(b,q,two).
+       unlock(b,p).unlock(b,q);                       % coh(p,q) = true
+
+
+% bisimulation tests, we compare system(Gx) with projected system(Lxa||..||Lxr)
+  G8 = (C(a,p,one)+C(a,p,two)).
+       (C(p,q,one)+C(p,q,two));                       % coh(p,q) = false  bisim = true
+  L8a= (send(a,p,one)+send(a,p,two)).tau;
+  L8p= (receive(a,p,one)+receive(a,p,two)).
+       (send(p,q,one)+send(p,q,two));
+  L8q= tau.(receive(p,q,one)+receive(p,q,two));
+
+  G9 = C(a,p,one).C(b,q,one)                   ;      % coh(p,q) = true  bisim = false
+  L9a= send(a,p,one).tau;
+  L9b= tau.send(b,q,one);
+  L9p= receive(a,p,one).tau;
+  L9q= tau.receive(b,q,one);
+
+
+% other testcases that excercize langauge constructs and model checking formula
+
+  % interleaved update of non-related attribute
+  G10= C(a,p,one).C(a,r,one).C(b,q,one);              % coh(p,q) = true 
+  G11= C(a,p,one).C(a,r,one).C(a,q,two);              % coh(p,q) = false
+
+  % choice constructs
+  G12= C(a,p,one).C(a,r,one).
+       (C(a,q,one) + C(a,p,two));                     % coh(p,q) = false
+  G13= C(a,p,one).C(a,r,one).
+       (C(a,q,one) + C(a,r,two));                     % coh(p,q) = true
+
+  % parallel construct
+  G14= C(a,p,one).C(a,q,one) || C(b,r,two);           % coh(p,q) = true
+
+  % recursive construct
+  G15= C(a,p,one).C(a,q,one).
+       C(a,q,two).C(a,p,two).G15;                     % coh(p,q) = true
+
+
+% ------------
+
+
+% shorthands added to beautify init process ;)
+
+  Role(N:RoleName) = Role'(N,zero) || LockManager(N,false,a);
+  Chan(from,to:RoleName) = Channel'(from,to,[],0);
+  Coherence(r1,r2:RoleName) = Coherence'(r1,r2,zero,zero,a);
+
+
+init
+
+  allow(
+     { send', receive', lastRole,lastEq, lock',unlock'},
+     comm( 
+        {send|enqueue|syncCoherence -> send', receive|dequeue|updateProp|setLast -> receive',
+         lock|lock -> lock', unlock|unlock -> unlock'},
+
+        % these processes occur in every system:
+        Role(a) || Role(b) || Role(p) || Role(q) || Role(r) || 
+        Chan(a,p) || Chan(a,q) || Chan(a,r) || Chan(b,p) || Chan(b,q) || Chan(b,r) ||
+        Chan(p,q) || Chan(p,r) || Chan(q,p) || Chan(q,r) || Chan(r,p) || Chan(r,q) ||
+        Coherence(p,q) ||    
+
+      % selected protocol instance:
+      % (for automated testing, please ensure that below is last source line)
+
+         L8a||L8p||L8q   ) );
